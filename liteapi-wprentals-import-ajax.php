@@ -124,7 +124,9 @@ function handle_liteapi_import() {
     // Build the LiteAPI Reviews URL - FIXED to match working cURL
     $hotel_id = HOTEL_ID; // Reuse existing constant for hotel ID
     $url = 'https://api.liteapi.travel/v3.0/data/reviews?hotelId=' . $hotel_id . '&limit=' . RCWPR_LIMIT . '&timeout=4&getSentiment=false';
+
     error_log('handle_liteapi_import: Requesting LiteAPI URL ' . $url);
+
     // Make HTTP GET request to LiteAPI using cURL directly (since wp_remote_get hangs)
     $ch = curl_init();
     curl_setopt($ch, CURLOPT_URL, $url);
