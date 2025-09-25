@@ -405,6 +405,9 @@ function rcwpr_map_review_payload($review) {
 
     $title = $headline !== '' ? $headline : wp_html_excerpt($comment, 80, '...');
 
+    $title = rcwpr_prepare_review_title($title);
+    $comment = rcwpr_prepare_review_content($comment);
+
     return array(
         'property_id' => RCWPR_PROPERTY_ID,
         'user_id' => RCWPR_REVIEW_USER_ID,
@@ -419,6 +422,94 @@ function rcwpr_map_review_payload($review) {
         'title' => $title,
         'content' => $comment,
     );
+}
+
+/**
+ * Prepare the review title for safe API submission.
+ *
+ * Normalises whitespace, removes unsafe characters and enforces a reasonable
+ * length so that the WPRentals endpoint receives a compact, UTF-8 clean value.
+ *
+ * @since 1.0.0
+ * @param string $title Raw title string.
+ * @return string Sanitised single-line title.
+ */
+function rcwpr_prepare_review_title($title) {
+    $title = rcwpr_normalise_review_text($title);
+    $title = sanitize_text_field($title);
+
+    if ($title === '') {
+        return __('Review', 'liteapi-wprentals-importer');
+    }
+
+    if (function_exists('mb_strlen') && function_exists('mb_substr')) {
+        if (mb_strlen($title) > 140) {
+            $title = rtrim(mb_substr($title, 0, 137)) . '...';
+        }
+    } elseif (strlen($title) > 140) {
+        $title = rtrim(substr($title, 0, 137)) . '...';
+    }
+
+    return $title;
+}
+
+/**
+ * Prepare the review content for safe API submission.
+ *
+ * Ensures multi-line text keeps intentional paragraph breaks while stripping
+ * problematic control characters that may cause the remote API to hang.
+ *
+ * @since 1.0.0
+ * @param string $content Raw content string.
+ * @return string Sanitised multi-line content.
+ */
+function rcwpr_prepare_review_content($content) {
+    $content = rcwpr_normalise_review_text($content, true);
+    $content = sanitize_textarea_field($content);
+
+    return $content;
+}
+
+/**
+ * Normalise incoming review text by removing control characters, decoding
+ * entities and reducing whitespace while optionally retaining newlines.
+ *
+ * @since 1.0.0
+ * @param string  $text         Raw text value.
+ * @param boolean $allow_breaks Whether to keep line breaks.
+ * @return string Cleaned text.
+ */
+function rcwpr_normalise_review_text($text, $allow_breaks = false) {
+    if (!is_string($text)) {
+        return '';
+    }
+
+    $text = html_entity_decode($text, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+
+    // Replace common Unicode bullets and dashes with ASCII equivalents.
+    $text = str_replace(array("\xE2\x80\xA2", "\xE2\x80\xA3", "\xE2\x97\x8F"), '- ', $text);
+    $text = str_replace(array("\xE2\x80\x93", "\xE2\x80\x94", "\xE2\x80\x95"), '-', $text);
+
+    // Normalise whitespace and remove control characters except allowed breaks.
+    $text = str_replace("\r\n", "\n", $text);
+    $text = str_replace("\r", "\n", $text);
+    $text = preg_replace('/[\x00-\x08\x0B-\x0C\x0E-\x1F\x7F]/u', '', $text);
+
+    if ($allow_breaks) {
+        $text = preg_replace("/\s*\n\s*/u", "\n", $text);
+    } else {
+        $text = preg_replace('/\s+/u', ' ', $text);
+    }
+
+    // Collapse multiple spaces and convert non-breaking spaces.
+    $text = str_replace("\xC2\xA0", ' ', $text);
+    $text = preg_replace('/[ \t]+/u', ' ', $text);
+
+    if ($allow_breaks) {
+        $text = preg_replace('/\n{2,}/u', "\n\n", $text);
+    }
+
+    return trim($text);
 }
 
 /**
