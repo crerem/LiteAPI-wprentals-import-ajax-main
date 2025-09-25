@@ -465,6 +465,7 @@ function rcwpr_prepare_review_title($title) {
  */
 function rcwpr_prepare_review_content($content) {
     $content = rcwpr_normalise_review_text($content, true);
+    $content = rcwpr_limit_text_length($content, 800);
     $content = sanitize_textarea_field($content);
 
     return $content;
@@ -509,7 +510,81 @@ function rcwpr_normalise_review_text($text, $allow_breaks = false) {
         $text = preg_replace('/\n{2,}/u', "\n\n", $text);
     }
 
+    $text = rcwpr_transliterate_to_ascii($text);
+
     return trim($text);
+}
+
+/**
+ * Convert UTF-8 text into a safe ASCII subset for API transport.
+ *
+ * Uses iconv transliteration when available and removes any remaining
+ * non-printable characters while preserving tabs and newlines.
+ *
+ * @since 1.0.0
+ * @param string $text Input text.
+ * @return string ASCII-only string.
+ */
+function rcwpr_transliterate_to_ascii($text) {
+    if (!is_string($text) || $text === '') {
+        return '';
+    }
+
+    if (function_exists('iconv')) {
+        $converted = @iconv('UTF-8', 'ASCII//TRANSLIT//IGNORE', $text);
+        if ($converted !== false) {
+            $text = $converted;
+        }
+    }
+
+    return preg_replace('/[^\x09\x0A\x0D\x20-\x7E]/', '', $text);
+}
+
+/**
+ * Limit text length while preserving word boundaries where possible.
+ *
+ * @since 1.0.0
+ * @param string $text       Raw text value.
+ * @param int    $max_length Maximum allowed length.
+ * @param string $ellipsis   Trailing suffix applied to truncated text.
+ * @return string Length-limited text.
+ */
+function rcwpr_limit_text_length($text, $max_length, $ellipsis = '...') {
+    if (!is_string($text)) {
+        return '';
+    }
+
+    $text = trim($text);
+
+    if ($text === '' || $max_length <= 0) {
+        return '';
+    }
+
+    $length = function_exists('mb_strlen') ? mb_strlen($text) : strlen($text);
+
+    if ($length <= $max_length) {
+        return $text;
+    }
+
+    $ellipsis_length = function_exists('mb_strlen') ? mb_strlen($ellipsis) : strlen($ellipsis);
+    $slice_length = max(0, $max_length - $ellipsis_length);
+
+    if ($slice_length === 0) {
+        return $ellipsis_length === 0 ? substr($text, 0, $max_length) : $ellipsis;
+    }
+
+    $slice = function_exists('mb_substr')
+        ? mb_substr($text, 0, $slice_length)
+        : substr($text, 0, $slice_length);
+
+    $slice = rtrim($slice);
+
+    // Attempt to trim back to the last whitespace to avoid mid-word truncation.
+    if (preg_match('/^(.+?)\s+[^\s]*$/u', $slice, $matches)) {
+        $slice = $matches[1];
+    }
+
+    return $slice . $ellipsis;
 }
 
 /**
