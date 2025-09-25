@@ -29,6 +29,7 @@ define('RCWPR_WP_RENTALS_URL', 'https://rentals.me');                // Target W
 define('RCWPR_WP_USERNAME', 'cretu');                                    // WPRentals username
 define('RCWPR_WP_PASSWORD', 'remus');                                    // WPRentals password
 define('RCWPR_PROPERTY_ID', 124);                                        // Default property ID for imported reviews
+define('RCWPR_REVIEW_USER_ID', 1);                                       // Default WP user ID authoring the imported reviews
 
 /**
  * Add admin menu item for the plugin
@@ -314,7 +315,7 @@ function import_to_wp_rentals($reviews) {
     }
 
     // Build the WPRentals API endpoint URL for reviews
-    $wp_residence_url = RCWPR_WP_RENTALS_URL . '/wp-json/wprentals/v1/reviews';
+    $wp_residence_url = RCWPR_WP_RENTALS_URL . '/wp-json/wprentals/v1/post-review';
 
     error_log('Starting review import to: ' . $wp_residence_url);
 
@@ -328,8 +329,8 @@ function import_to_wp_rentals($reviews) {
         // Map LiteAPI review to WPRentals format
         $wp_review = rcwpr_map_review_payload($review);
 
-        if (empty($wp_review['comment'])) {
-            error_log('Skipping review ' . ($index + 1) . ' because the generated comment is empty.');
+        if (empty($wp_review['content'])) {
+            error_log('Skipping review ' . ($index + 1) . ' because the generated content is empty.');
             continue;
         }
 
@@ -422,9 +423,6 @@ function rcwpr_map_review_payload($review) {
 
     $comment = trim(implode("\n\n", array_filter($comment_sections, 'strlen')));
 
-    $rating_value = isset($review['averageScore']) ? floatval($review['averageScore']) : 0;
-    $rating = $rating_value > 0 ? max(1, min(5, round($rating_value / 2))) : 5;
-
     $language = isset($review['language']) ? sanitize_text_field($review['language']) : '';
     $country = isset($review['country']) ? sanitize_text_field($review['country']) : '';
     $travel_type = isset($review['type']) ? sanitize_text_field($review['type']) : '';
@@ -436,11 +434,18 @@ function rcwpr_map_review_payload($review) {
 
     return array(
         'property_id' => RCWPR_PROPERTY_ID,
-        'reviewer_name' => $name,
-        'reviewer_email' => $email,
-        'rating' => $rating,
+        'user_id' => RCWPR_REVIEW_USER_ID,
+        'rating' => 1,
+        'ratings' => array(
+            'accuracy' => 1,
+            'communication' => 1,
+            'cleanliness' => 1,
+            'location' => 1,
+            'check_in' => 1,
+            'value' => 1,
+        ),
         'title' => $title,
-        'comment' => $comment,
+        'content' => $comment,
         'language' => $language,
         'country' => $country,
         'travel_type' => $travel_type,
@@ -448,7 +453,9 @@ function rcwpr_map_review_payload($review) {
         'source' => $source,
         'date' => $date,
         'status' => 'approved',
-        'external_id' => rcwpr_generate_external_id($review)
+        'external_id' => rcwpr_generate_external_id($review),
+        'reviewer_name' => $name,
+        'reviewer_email' => $email,
     );
 }
 
