@@ -28,6 +28,8 @@ define('RCWPR_LIMIT', '15');                                              // Num
 define('RCWPR_WP_RENTALS_URL', 'https://rentals.me');                // Target WPRentals site URL
 define('RCWPR_WP_USERNAME', 'cretu');                                    // WPRentals username
 define('RCWPR_WP_PASSWORD', 'remus');                                    // WPRentals password
+define('RCWPR_PROPERTY_ID', 124);                                        // Default property ID for imported reviews
+define('RCWPR_DEFAULT_USER_ID', 1);                                      // Default WP user authoring imported reviews
 
 /**
  * Add admin menu item for the plugin
@@ -117,11 +119,13 @@ add_action('wp_ajax_start_import', 'handle_liteapi_import');
  * @return void Outputs JSON response and exits
  */
 function handle_liteapi_import() {
-    
+
+    error_log('handle_liteapi_import: AJAX request received.');
+
     // Build the LiteAPI Reviews URL - FIXED to match working cURL
     $hotel_id = HOTEL_ID; // Reuse existing constant for hotel ID
     $url = 'https://api.liteapi.travel/v3.0/data/reviews?hotelId=' . $hotel_id . '&limit=' . RCWPR_LIMIT . '&timeout=4&getSentiment=false';
-    ;
+    error_log('handle_liteapi_import: Requesting LiteAPI URL ' . $url);
     // Make HTTP GET request to LiteAPI using cURL directly (since wp_remote_get hangs)
     $ch = curl_init();
     curl_setopt($ch, CURLOPT_URL, $url);
@@ -135,38 +139,43 @@ function handle_liteapi_import() {
     curl_setopt($ch, CURLOPT_USERAGENT, 'WordPress/LiteAPI-Plugin');
     
     $body = curl_exec($ch);
-    print_r($body);return;
     $http_code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
     $error = curl_error($ch);
+    error_log('handle_liteapi_import: LiteAPI HTTP status ' . $http_code . ' (error: ' . ($error !== '' ? $error : 'none') . ')');
     curl_close($ch);
 
 
-    
+
     // Check for cURL errors
     if ($error) {
         wp_send_json_error('cURL Error: ' . $error);
+        error_log('handle_liteapi_import: Aborting due to cURL error.');
         return;
     }
-    
+
     // Check HTTP response code
     if ($http_code !== 200) {
         wp_send_json_error('LiteAPI returned HTTP ' . $http_code . '. Response: ' . substr($body, 0, 200));
+        error_log('handle_liteapi_import: LiteAPI non-200 response, aborting. Body snippet: ' . substr($body, 0, 500));
         return;
     }
     $response_data = json_decode($body, true);
-    
+    error_log('handle_liteapi_import: LiteAPI raw body length ' . strlen($body));
+
     // Check for JSON decode errors
     if (json_last_error() !== JSON_ERROR_NONE) {
         wp_send_json_error('Invalid JSON response from API: ' . json_last_error_msg());
+        error_log('handle_liteapi_import: JSON decode error - ' . json_last_error_msg());
         return;
     }
-    
+
     // Debug: Log the raw response
     error_log('LiteAPI Response: ' . $body);
     
     // Check if the response contains an error
     if (isset($response_data['error'])) {
         wp_send_json_error('API Error: ' . $response_data['error']);
+        error_log('handle_liteapi_import: API reported error - ' . print_r($response_data['error'], true));
         return;
     }
     
@@ -183,9 +192,12 @@ function handle_liteapi_import() {
     // Validate that we received review data
     if (empty($reviews) || !is_array($reviews)) {
         wp_send_json_error('No valid reviews found in API response. Response structure: ' . print_r($response_data, true));
+        error_log('handle_liteapi_import: No reviews found - ' . print_r($response_data, true));
         return;
     }
-    
+
+    error_log('handle_liteapi_import: Retrieved ' . count($reviews) . ' reviews from LiteAPI.');
+
     // Generate HTML table for displaying reviews
     $table_html = '<table class="wp-list-table widefat fixed striped">';
     
@@ -217,12 +229,18 @@ function handle_liteapi_import() {
     
     // Import to WPRentals
     import_to_wp_rentals($reviews);
-    
-    // Send success response
-    wp_send_json_success(array(
+
+    error_log('handle_liteapi_import: Finished pushing reviews to WPRentals. Preparing AJAX response.');
+
+    $response_payload = array(
         'table' => $table_html,
         'count' => count($reviews)
-    ));
+    );
+
+    error_log('handle_liteapi_import: Responding with payload: ' . json_encode($response_payload));
+
+    // Send success response
+    wp_send_json_success($response_payload);
 }
 
 
@@ -288,45 +306,42 @@ function get_wp_residence_token() {
 function import_to_wp_rentals($reviews) {
     // Get JWT token for authentication
     $token = get_wp_residence_token();
-    
+
     if (!$token) {
         error_log('Failed to get JWT token - skipping WPRentals import but continuing with display');
         return;
     }
-    
+
     // Build the WPRentals API endpoint URL for reviews
-    $wp_residence_url = RCWPR_WP_RENTALS_URL . '/wp-json/wprentals/v1/reviews';
-    
+    $wp_residence_url = RCWPR_WP_RENTALS_URL . '/wp-json/wprentals/v1/post-review';
+
     error_log('Starting review import to: ' . $wp_residence_url);
-    
+
     // Process each review individually
     foreach ($reviews as $index => $review) {
-        
+
         if (!is_array($review)) {
             continue;
         }
-        
+
         // Map LiteAPI review to WPRentals format
-        $wp_review = array(
-            'property_id' => 124, // You'll need to determine the correct property ID
-            'reviewer_name' => isset($review['name']) ? $review['name'] : 'Anonymous',
-            'reviewer_email' => isset($review['reviewer_email']) ? $review['reviewer_email'] : 'noreply@example.com',
-            'rating' => isset($review['averageScore']) ? round($review['averageScore'] / 2) : 5, // Convert 10-point to 5-point scale
-            'comment' => isset($review['pros']) ? $review['pros'] : (isset($review['headline']) ? $review['headline'] : ''),
-            'date' => isset($review['date']) ? $review['date'] : date('Y-m-d'),
-            'status' => 'approved'
-        );
-        
+        $wp_review = rcwpr_map_review_payload($review);
+
+        if (empty($wp_review['content'])) {
+            error_log('Skipping review ' . ($index + 1) . ' because the generated content is empty.');
+            continue;
+        }
+
         error_log('Importing review ' . ($index + 1) . ': ' . (isset($review['name']) ? $review['name'] : 'Anonymous'));
         error_log('Review data being sent: ' . json_encode($wp_review, JSON_PRETTY_PRINT));
-        
+
         // Send POST request to WPRentals API
         $response = wp_remote_post($wp_residence_url, array(
             'headers' => array(
                 'Content-Type' => 'application/json',
                 'Authorization' => 'Bearer ' . $token
             ),
-            'body' => json_encode($wp_review),
+            'body' => wp_json_encode($wp_review),
             'timeout' => 30,
             'sslverify' => false
         ));
@@ -339,8 +354,10 @@ function import_to_wp_rentals($reviews) {
             $response_body = wp_remote_retrieve_body($response);
             error_log('Review Import Response: Code ' . $response_code . ' - ' . $response_body);
             
-            if ($response_code === 200 || $response_code === 201) {
+            if (in_array($response_code, array(200, 201), true)) {
                 error_log('SUCCESS: Review imported successfully');
+            } elseif ($response_code === 409) {
+                error_log('NOTICE: Review already exists in WPRentals (409 Conflict).');
             } else {
                 error_log('FAILED: Review import failed with code ' . $response_code);
             }
@@ -348,6 +365,171 @@ function import_to_wp_rentals($reviews) {
     }
     
     error_log('Finished importing all reviews');
+}
+
+/**
+ * Map a LiteAPI review to the payload expected by the WPRentals `post-review`
+ * endpoint. The endpoint requires a property, an authoring user, a ratings map
+ * (accuracy, communication, cleanliness, location, check_in, value), together
+ * with the title and content of the review body. We reuse the LiteAPI
+ * `averageScore` for every rating category so that the incoming sentiment is
+ * preserved even though LiteAPI does not expose per-category scores.
+ *
+ * Additional LiteAPI fields (language, country, etc.) are appended to the
+ * review content to keep that information visible to administrators.
+ *
+ * @param array $review LiteAPI review item.
+ * @return array
+ */
+function rcwpr_map_review_payload($review) {
+    $name = isset($review['name']) && $review['name'] !== '' ? $review['name'] : 'Anonymous';
+    $email = isset($review['reviewer_email']) && is_email($review['reviewer_email'])
+        ? $review['reviewer_email']
+        : rcwpr_generate_placeholder_email($name);
+
+    $headline = isset($review['headline']) ? trim(wp_strip_all_tags($review['headline'])) : '';
+    $pros = isset($review['pros']) ? trim(wp_strip_all_tags($review['pros'])) : '';
+    $cons = isset($review['cons']) ? trim(wp_strip_all_tags($review['cons'])) : '';
+
+    $comment_sections = array();
+
+    if ($pros !== '') {
+        $comment_sections[] = $pros;
+    }
+
+    if ($cons !== '') {
+        $comment_sections[] = 'Cons: ' . $cons;
+    }
+
+    if ($headline !== '') {
+        array_unshift($comment_sections, $headline);
+    }
+
+    if (empty($comment_sections) && isset($review['review'])) {
+        $comment_sections[] = trim(wp_strip_all_tags($review['review']));
+    }
+
+    $comment = trim(implode("\n\n", array_filter($comment_sections, 'strlen')));
+
+    $rating_value = isset($review['averageScore']) ? floatval($review['averageScore']) : 0;
+    $rating = $rating_value > 0 ? max(1, min(5, round($rating_value / 2))) : 5;
+
+    $language = isset($review['language']) ? sanitize_text_field($review['language']) : '';
+    $country = isset($review['country']) ? sanitize_text_field($review['country']) : '';
+    $travel_type = isset($review['type']) ? sanitize_text_field($review['type']) : '';
+    $source = isset($review['source']) ? sanitize_text_field($review['source']) : 'liteapi';
+
+    $date = rcwpr_normalize_review_date(isset($review['date']) ? $review['date'] : '');
+
+    $title = $headline !== '' ? $headline : wp_html_excerpt($comment, 80, '...');
+
+    $content_sections = array(
+        $comment,
+        '',
+        'Date: ' . $date,
+        'Language: ' . ($language !== '' ? $language : 'n/a'),
+        'Country: ' . ($country !== '' ? $country : 'n/a'),
+        'Travel type: ' . ($travel_type !== '' ? $travel_type : 'n/a'),
+        'Source: ' . $source,
+        'Reviewer: ' . $name . ' <' . $email . '>',
+        'Reference: ' . rcwpr_generate_external_id($review)
+    );
+
+    $content = trim(implode("\n", array_filter($content_sections, 'strlen')));
+
+    return array(
+        'property_id' => (string) RCWPR_PROPERTY_ID,
+        'user_id' => (string) RCWPR_DEFAULT_USER_ID,
+        'ratings' => rcwpr_build_ratings_payload($rating_value),
+        'title' => $title,
+        'content' => $content
+    );
+}
+
+/**
+ * Build the ratings payload required by the WPRentals endpoint.
+ *
+ * The endpoint expects separate category ratings, but LiteAPI only provides
+ * a single averageScore (0-10). We normalise this value to a 1-5 scale and
+ * reuse it for each category to satisfy the schema while preserving the
+ * original sentiment in a consistent way.
+ *
+ * @param float $average_score
+ * @return array
+ */
+function rcwpr_build_ratings_payload($average_score) {
+    $normalised = 0;
+
+    if ($average_score > 0) {
+        $normalised = round(max(1, min(5, $average_score / 2)), 1);
+    }
+
+    if ($normalised === 0) {
+        $normalised = 5;
+    }
+
+    return array(
+        'accuracy' => $normalised,
+        'communication' => $normalised,
+        'cleanliness' => $normalised,
+        'location' => $normalised,
+        'check_in' => $normalised,
+        'value' => $normalised,
+    );
+}
+
+/**
+ * Normalise the review date to the format expected by the API (Y-m-d H:i:s).
+ *
+ * @param string $date_string
+ * @return string
+ */
+function rcwpr_normalize_review_date($date_string) {
+    if (empty($date_string)) {
+        return current_time('mysql', true);
+    }
+
+    $timestamp = strtotime($date_string);
+
+    if ($timestamp === false) {
+        return current_time('mysql', true);
+    }
+
+    return gmdate('Y-m-d H:i:s', $timestamp);
+}
+
+/**
+ * Generate a stable hash for the review so we can prevent duplicates on the API side.
+ *
+ * @param array $review
+ * @return string
+ */
+function rcwpr_generate_external_id($review) {
+    $parts = array(
+        isset($review['date']) ? $review['date'] : '',
+        isset($review['name']) ? $review['name'] : '',
+        isset($review['averageScore']) ? $review['averageScore'] : '',
+        isset($review['pros']) ? $review['pros'] : '',
+        isset($review['cons']) ? $review['cons'] : ''
+    );
+
+    return md5(implode('|', $parts));
+}
+
+/**
+ * Create a deterministic placeholder email address when the review does not provide one.
+ *
+ * @param string $name Reviewer name.
+ * @return string
+ */
+function rcwpr_generate_placeholder_email($name) {
+    $sanitized_name = sanitize_title($name);
+
+    if ($sanitized_name === '') {
+        $sanitized_name = 'guest-' . substr(md5($name), 0, 6);
+    }
+
+    return strtolower($sanitized_name) . '@example.com';
 }
 
 /**
