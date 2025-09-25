@@ -29,6 +29,7 @@ define('RCWPR_WP_RENTALS_URL', 'https://rentals.me');                // Target W
 define('RCWPR_WP_USERNAME', 'cretu');                                    // WPRentals username
 define('RCWPR_WP_PASSWORD', 'remus');                                    // WPRentals password
 define('RCWPR_PROPERTY_ID', 124);                                        // Default property ID for imported reviews
+define('RCWPR_REVIEW_USER_ID', 1);                                       // Default WP user ID authoring the imported reviews
 
 /**
  * Add admin menu item for the plugin
@@ -314,7 +315,7 @@ function import_to_wp_rentals($reviews) {
     }
 
     // Build the WPRentals API endpoint URL for reviews
-    $wp_residence_url = RCWPR_WP_RENTALS_URL . '/wp-json/wprentals/v1/reviews';
+    $wp_residence_url = RCWPR_WP_RENTALS_URL . '/wp-json/wprentals/v1/post-review';
 
     error_log('Starting review import to: ' . $wp_residence_url);
 
@@ -328,8 +329,8 @@ function import_to_wp_rentals($reviews) {
         // Map LiteAPI review to WPRentals format
         $wp_review = rcwpr_map_review_payload($review);
 
-        if (empty($wp_review['comment'])) {
-            error_log('Skipping review ' . ($index + 1) . ' because the generated comment is empty.');
+        if (empty($wp_review['content'])) {
+            error_log('Skipping review ' . ($index + 1) . ' because the generated content is empty.');
             continue;
         }
 
@@ -371,33 +372,13 @@ function import_to_wp_rentals($reviews) {
 /**
  * Map a LiteAPI review to the payload expected by the WPRentals endpoint.
  *
- * The Postman documentation referenced in the task specifies the following fields:
- * - property_id (required)
- * - reviewer_name
- * - reviewer_email
- * - rating (1-5 integer)
- * - title (short summary of the review)
- * - comment (full review body)
- * - language
- * - country
- * - travel_type
- * - source
- * - date (Y-m-d H:i:s)
- * - status (approved|pending)
- * - external_id (used to avoid duplicate imports)
- *
- * The LiteAPI payload does not include all these fields directly, so we derive as much
- * information as possible and provide sensible defaults for the rest.
+ * The user requested payload includes only the identifiers, review body and a hard-coded
+ * set of 1-star category ratings required by the WPRentals endpoint.
  *
  * @param array $review LiteAPI review item.
- * @return array
+ * @return array Minimal payload for the WPRentals review import endpoint.
  */
 function rcwpr_map_review_payload($review) {
-    $name = isset($review['name']) && $review['name'] !== '' ? $review['name'] : 'Anonymous';
-    $email = isset($review['reviewer_email']) && is_email($review['reviewer_email'])
-        ? $review['reviewer_email']
-        : rcwpr_generate_placeholder_email($name);
-
     $headline = isset($review['headline']) ? trim(wp_strip_all_tags($review['headline'])) : '';
     $pros = isset($review['pros']) ? trim(wp_strip_all_tags($review['pros'])) : '';
     $cons = isset($review['cons']) ? trim(wp_strip_all_tags($review['cons'])) : '';
@@ -422,88 +403,188 @@ function rcwpr_map_review_payload($review) {
 
     $comment = trim(implode("\n\n", array_filter($comment_sections, 'strlen')));
 
-    $rating_value = isset($review['averageScore']) ? floatval($review['averageScore']) : 0;
-    $rating = $rating_value > 0 ? max(1, min(5, round($rating_value / 2))) : 5;
-
-    $language = isset($review['language']) ? sanitize_text_field($review['language']) : '';
-    $country = isset($review['country']) ? sanitize_text_field($review['country']) : '';
-    $travel_type = isset($review['type']) ? sanitize_text_field($review['type']) : '';
-    $source = isset($review['source']) ? sanitize_text_field($review['source']) : 'liteapi';
-
-    $date = rcwpr_normalize_review_date(isset($review['date']) ? $review['date'] : '');
-
     $title = $headline !== '' ? $headline : wp_html_excerpt($comment, 80, '...');
+
+    $title = rcwpr_prepare_review_title($title);
+    $comment = rcwpr_prepare_review_content($comment);
 
     return array(
         'property_id' => RCWPR_PROPERTY_ID,
-        'reviewer_name' => $name,
-        'reviewer_email' => $email,
-        'rating' => $rating,
+        'user_id' => RCWPR_REVIEW_USER_ID,
+        'ratings' => array(
+            'accuracy' => 1,
+            'communication' => 1,
+            'cleanliness' => 1,
+            'location' => 1,
+            'check_in' => 1,
+            'value' => 1,
+        ),
         'title' => $title,
-        'comment' => $comment,
-        'language' => $language,
-        'country' => $country,
-        'travel_type' => $travel_type,
-        'type' => $travel_type,
-        'source' => $source,
-        'date' => $date,
-        'status' => 'approved',
-        'external_id' => rcwpr_generate_external_id($review)
+        'content' => $comment,
     );
 }
 
 /**
- * Normalise the review date to the format expected by the API (Y-m-d H:i:s).
+ * Prepare the review title for safe API submission.
  *
- * @param string $date_string
- * @return string
+ * Normalises whitespace, removes unsafe characters and enforces a reasonable
+ * length so that the WPRentals endpoint receives a compact, UTF-8 clean value.
+ *
+ * @since 1.0.0
+ * @param string $title Raw title string.
+ * @return string Sanitised single-line title.
  */
-function rcwpr_normalize_review_date($date_string) {
-    if (empty($date_string)) {
-        return current_time('mysql', true);
+function rcwpr_prepare_review_title($title) {
+    $title = rcwpr_normalise_review_text($title);
+    $title = sanitize_text_field($title);
+
+    if ($title === '') {
+        return __('Review', 'liteapi-wprentals-importer');
     }
 
-    $timestamp = strtotime($date_string);
-
-    if ($timestamp === false) {
-        return current_time('mysql', true);
+    if (function_exists('mb_strlen') && function_exists('mb_substr')) {
+        if (mb_strlen($title) > 140) {
+            $title = rtrim(mb_substr($title, 0, 137)) . '...';
+        }
+    } elseif (strlen($title) > 140) {
+        $title = rtrim(substr($title, 0, 137)) . '...';
     }
 
-    return gmdate('Y-m-d H:i:s', $timestamp);
+    return $title;
 }
 
 /**
- * Generate a stable hash for the review so we can prevent duplicates on the API side.
+ * Prepare the review content for safe API submission.
  *
- * @param array $review
- * @return string
+ * Ensures multi-line text keeps intentional paragraph breaks while stripping
+ * problematic control characters that may cause the remote API to hang.
+ *
+ * @since 1.0.0
+ * @param string $content Raw content string.
+ * @return string Sanitised multi-line content.
  */
-function rcwpr_generate_external_id($review) {
-    $parts = array(
-        isset($review['date']) ? $review['date'] : '',
-        isset($review['name']) ? $review['name'] : '',
-        isset($review['averageScore']) ? $review['averageScore'] : '',
-        isset($review['pros']) ? $review['pros'] : '',
-        isset($review['cons']) ? $review['cons'] : ''
-    );
+function rcwpr_prepare_review_content($content) {
+    $content = rcwpr_normalise_review_text($content, true);
+    $content = rcwpr_limit_text_length($content, 800);
+    $content = sanitize_textarea_field($content);
 
-    return md5(implode('|', $parts));
+    return $content;
 }
 
 /**
- * Create a deterministic placeholder email address when the review does not provide one.
+ * Normalise incoming review text by removing control characters, decoding
+ * entities and reducing whitespace while optionally retaining newlines.
  *
- * @param string $name Reviewer name.
- * @return string
+ * @since 1.0.0
+ * @param string  $text         Raw text value.
+ * @param boolean $allow_breaks Whether to keep line breaks.
+ * @return string Cleaned text.
  */
-function rcwpr_generate_placeholder_email($name) {
-    $sanitized_name = sanitize_title($name);
-
-    if ($sanitized_name === '') {
-        $sanitized_name = 'guest-' . substr(md5($name), 0, 6);
+function rcwpr_normalise_review_text($text, $allow_breaks = false) {
+    if (!is_string($text)) {
+        return '';
     }
 
-    return strtolower($sanitized_name) . '@example.com';
+    $text = html_entity_decode($text, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+
+    // Replace common Unicode bullets and dashes with ASCII equivalents.
+    $text = str_replace(array("\xE2\x80\xA2", "\xE2\x80\xA3", "\xE2\x97\x8F"), '- ', $text);
+    $text = str_replace(array("\xE2\x80\x93", "\xE2\x80\x94", "\xE2\x80\x95"), '-', $text);
+
+    // Normalise whitespace and remove control characters except allowed breaks.
+    $text = str_replace("\r\n", "\n", $text);
+    $text = str_replace("\r", "\n", $text);
+    $text = preg_replace('/[\x00-\x08\x0B-\x0C\x0E-\x1F\x7F]/u', '', $text);
+
+    if ($allow_breaks) {
+        $text = preg_replace("/\s*\n\s*/u", "\n", $text);
+    } else {
+        $text = preg_replace('/\s+/u', ' ', $text);
+    }
+
+    // Collapse multiple spaces and convert non-breaking spaces.
+    $text = str_replace("\xC2\xA0", ' ', $text);
+    $text = preg_replace('/[ \t]+/u', ' ', $text);
+
+    if ($allow_breaks) {
+        $text = preg_replace('/\n{2,}/u', "\n\n", $text);
+    }
+
+    $text = rcwpr_transliterate_to_ascii($text);
+
+    return trim($text);
+}
+
+/**
+ * Convert UTF-8 text into a safe ASCII subset for API transport.
+ *
+ * Uses iconv transliteration when available and removes any remaining
+ * non-printable characters while preserving tabs and newlines.
+ *
+ * @since 1.0.0
+ * @param string $text Input text.
+ * @return string ASCII-only string.
+ */
+function rcwpr_transliterate_to_ascii($text) {
+    if (!is_string($text) || $text === '') {
+        return '';
+    }
+
+    if (function_exists('iconv')) {
+        $converted = @iconv('UTF-8', 'ASCII//TRANSLIT//IGNORE', $text);
+        if ($converted !== false) {
+            $text = $converted;
+        }
+    }
+
+    return preg_replace('/[^\x09\x0A\x0D\x20-\x7E]/', '', $text);
+}
+
+/**
+ * Limit text length while preserving word boundaries where possible.
+ *
+ * @since 1.0.0
+ * @param string $text       Raw text value.
+ * @param int    $max_length Maximum allowed length.
+ * @param string $ellipsis   Trailing suffix applied to truncated text.
+ * @return string Length-limited text.
+ */
+function rcwpr_limit_text_length($text, $max_length, $ellipsis = '...') {
+    if (!is_string($text)) {
+        return '';
+    }
+
+    $text = trim($text);
+
+    if ($text === '' || $max_length <= 0) {
+        return '';
+    }
+
+    $length = function_exists('mb_strlen') ? mb_strlen($text) : strlen($text);
+
+    if ($length <= $max_length) {
+        return $text;
+    }
+
+    $ellipsis_length = function_exists('mb_strlen') ? mb_strlen($ellipsis) : strlen($ellipsis);
+    $slice_length = max(0, $max_length - $ellipsis_length);
+
+    if ($slice_length === 0) {
+        return $ellipsis_length === 0 ? substr($text, 0, $max_length) : $ellipsis;
+    }
+
+    $slice = function_exists('mb_substr')
+        ? mb_substr($text, 0, $slice_length)
+        : substr($text, 0, $slice_length);
+
+    $slice = rtrim($slice);
+
+    // Attempt to trim back to the last whitespace to avoid mid-word truncation.
+    if (preg_match('/^(.+?)\s+[^\s]*$/u', $slice, $matches)) {
+        $slice = $matches[1];
+    }
+
+    return $slice . $ellipsis;
 }
 
 /**
