@@ -28,6 +28,7 @@ define('RCWPR_LIMIT', '15');                                              // Num
 define('RCWPR_WP_RENTALS_URL', 'https://rentals.me');                // Target WPRentals site URL
 define('RCWPR_WP_USERNAME', 'cretu');                                    // WPRentals username
 define('RCWPR_WP_PASSWORD', 'remus');                                    // WPRentals password
+define('RCWPR_PROPERTY_ID', 124);                                        // Default property ID for imported reviews
 
 /**
  * Add admin menu item for the plugin
@@ -121,7 +122,6 @@ function handle_liteapi_import() {
     // Build the LiteAPI Reviews URL - FIXED to match working cURL
     $hotel_id = HOTEL_ID; // Reuse existing constant for hotel ID
     $url = 'https://api.liteapi.travel/v3.0/data/reviews?hotelId=' . $hotel_id . '&limit=' . RCWPR_LIMIT . '&timeout=4&getSentiment=false';
-    ;
     // Make HTTP GET request to LiteAPI using cURL directly (since wp_remote_get hangs)
     $ch = curl_init();
     curl_setopt($ch, CURLOPT_URL, $url);
@@ -135,7 +135,6 @@ function handle_liteapi_import() {
     curl_setopt($ch, CURLOPT_USERAGENT, 'WordPress/LiteAPI-Plugin');
     
     $body = curl_exec($ch);
-    print_r($body);return;
     $http_code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
     $error = curl_error($ch);
     curl_close($ch);
@@ -288,45 +287,42 @@ function get_wp_residence_token() {
 function import_to_wp_rentals($reviews) {
     // Get JWT token for authentication
     $token = get_wp_residence_token();
-    
+
     if (!$token) {
         error_log('Failed to get JWT token - skipping WPRentals import but continuing with display');
         return;
     }
-    
+
     // Build the WPRentals API endpoint URL for reviews
     $wp_residence_url = RCWPR_WP_RENTALS_URL . '/wp-json/wprentals/v1/reviews';
-    
+
     error_log('Starting review import to: ' . $wp_residence_url);
-    
+
     // Process each review individually
     foreach ($reviews as $index => $review) {
-        
+
         if (!is_array($review)) {
             continue;
         }
-        
+
         // Map LiteAPI review to WPRentals format
-        $wp_review = array(
-            'property_id' => 124, // You'll need to determine the correct property ID
-            'reviewer_name' => isset($review['name']) ? $review['name'] : 'Anonymous',
-            'reviewer_email' => isset($review['reviewer_email']) ? $review['reviewer_email'] : 'noreply@example.com',
-            'rating' => isset($review['averageScore']) ? round($review['averageScore'] / 2) : 5, // Convert 10-point to 5-point scale
-            'comment' => isset($review['pros']) ? $review['pros'] : (isset($review['headline']) ? $review['headline'] : ''),
-            'date' => isset($review['date']) ? $review['date'] : date('Y-m-d'),
-            'status' => 'approved'
-        );
-        
+        $wp_review = rcwpr_map_review_payload($review);
+
+        if (empty($wp_review['comment'])) {
+            error_log('Skipping review ' . ($index + 1) . ' because the generated comment is empty.');
+            continue;
+        }
+
         error_log('Importing review ' . ($index + 1) . ': ' . (isset($review['name']) ? $review['name'] : 'Anonymous'));
         error_log('Review data being sent: ' . json_encode($wp_review, JSON_PRETTY_PRINT));
-        
+
         // Send POST request to WPRentals API
         $response = wp_remote_post($wp_residence_url, array(
             'headers' => array(
                 'Content-Type' => 'application/json',
                 'Authorization' => 'Bearer ' . $token
             ),
-            'body' => json_encode($wp_review),
+            'body' => wp_json_encode($wp_review),
             'timeout' => 30,
             'sslverify' => false
         ));
@@ -339,8 +335,10 @@ function import_to_wp_rentals($reviews) {
             $response_body = wp_remote_retrieve_body($response);
             error_log('Review Import Response: Code ' . $response_code . ' - ' . $response_body);
             
-            if ($response_code === 200 || $response_code === 201) {
+            if (in_array($response_code, array(200, 201), true)) {
                 error_log('SUCCESS: Review imported successfully');
+            } elseif ($response_code === 409) {
+                error_log('NOTICE: Review already exists in WPRentals (409 Conflict).');
             } else {
                 error_log('FAILED: Review import failed with code ' . $response_code);
             }
@@ -348,6 +346,144 @@ function import_to_wp_rentals($reviews) {
     }
     
     error_log('Finished importing all reviews');
+}
+
+/**
+ * Map a LiteAPI review to the payload expected by the WPRentals endpoint.
+ *
+ * The Postman documentation referenced in the task specifies the following fields:
+ * - property_id (required)
+ * - reviewer_name
+ * - reviewer_email
+ * - rating (1-5 integer)
+ * - title (short summary of the review)
+ * - comment (full review body)
+ * - language
+ * - country
+ * - travel_type
+ * - source
+ * - date (Y-m-d H:i:s)
+ * - status (approved|pending)
+ * - external_id (used to avoid duplicate imports)
+ *
+ * The LiteAPI payload does not include all these fields directly, so we derive as much
+ * information as possible and provide sensible defaults for the rest.
+ *
+ * @param array $review LiteAPI review item.
+ * @return array
+ */
+function rcwpr_map_review_payload($review) {
+    $name = isset($review['name']) && $review['name'] !== '' ? $review['name'] : 'Anonymous';
+    $email = isset($review['reviewer_email']) && is_email($review['reviewer_email'])
+        ? $review['reviewer_email']
+        : rcwpr_generate_placeholder_email($name);
+
+    $headline = isset($review['headline']) ? trim(wp_strip_all_tags($review['headline'])) : '';
+    $pros = isset($review['pros']) ? trim(wp_strip_all_tags($review['pros'])) : '';
+    $cons = isset($review['cons']) ? trim(wp_strip_all_tags($review['cons'])) : '';
+
+    $comment_sections = array();
+
+    if ($pros !== '') {
+        $comment_sections[] = $pros;
+    }
+
+    if ($cons !== '') {
+        $comment_sections[] = 'Cons: ' . $cons;
+    }
+
+    if ($headline !== '') {
+        array_unshift($comment_sections, $headline);
+    }
+
+    if (empty($comment_sections) && isset($review['review'])) {
+        $comment_sections[] = trim(wp_strip_all_tags($review['review']));
+    }
+
+    $comment = trim(implode("\n\n", array_filter($comment_sections, 'strlen')));
+
+    $rating_value = isset($review['averageScore']) ? floatval($review['averageScore']) : 0;
+    $rating = $rating_value > 0 ? max(1, min(5, round($rating_value / 2))) : 5;
+
+    $language = isset($review['language']) ? sanitize_text_field($review['language']) : '';
+    $country = isset($review['country']) ? sanitize_text_field($review['country']) : '';
+    $travel_type = isset($review['type']) ? sanitize_text_field($review['type']) : '';
+    $source = isset($review['source']) ? sanitize_text_field($review['source']) : 'liteapi';
+
+    $date = rcwpr_normalize_review_date(isset($review['date']) ? $review['date'] : '');
+
+    $title = $headline !== '' ? $headline : wp_html_excerpt($comment, 80, '...');
+
+    return array(
+        'property_id' => RCWPR_PROPERTY_ID,
+        'reviewer_name' => $name,
+        'reviewer_email' => $email,
+        'rating' => $rating,
+        'title' => $title,
+        'comment' => $comment,
+        'language' => $language,
+        'country' => $country,
+        'travel_type' => $travel_type,
+        'type' => $travel_type,
+        'source' => $source,
+        'date' => $date,
+        'status' => 'approved',
+        'external_id' => rcwpr_generate_external_id($review)
+    );
+}
+
+/**
+ * Normalise the review date to the format expected by the API (Y-m-d H:i:s).
+ *
+ * @param string $date_string
+ * @return string
+ */
+function rcwpr_normalize_review_date($date_string) {
+    if (empty($date_string)) {
+        return current_time('mysql', true);
+    }
+
+    $timestamp = strtotime($date_string);
+
+    if ($timestamp === false) {
+        return current_time('mysql', true);
+    }
+
+    return gmdate('Y-m-d H:i:s', $timestamp);
+}
+
+/**
+ * Generate a stable hash for the review so we can prevent duplicates on the API side.
+ *
+ * @param array $review
+ * @return string
+ */
+function rcwpr_generate_external_id($review) {
+    $parts = array(
+        isset($review['date']) ? $review['date'] : '',
+        isset($review['name']) ? $review['name'] : '',
+        isset($review['averageScore']) ? $review['averageScore'] : '',
+        isset($review['pros']) ? $review['pros'] : '',
+        isset($review['cons']) ? $review['cons'] : ''
+    );
+
+    return md5(implode('|', $parts));
+}
+
+/**
+ * Create a deterministic placeholder email address when the review does not provide one.
+ *
+ * @param string $name Reviewer name.
+ * @return string
+ */
+function rcwpr_generate_placeholder_email($name) {
+    $sanitized_name = sanitize_title($name);
+
+    if ($sanitized_name === '') {
+        $sanitized_name = 'guest-' . substr(md5($name), 0, 6);
+    }
+
+    return strtolower($sanitized_name) . '@example.com';
 }
 
 /**
