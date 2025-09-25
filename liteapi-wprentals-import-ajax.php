@@ -372,33 +372,13 @@ function import_to_wp_rentals($reviews) {
 /**
  * Map a LiteAPI review to the payload expected by the WPRentals endpoint.
  *
- * The Postman documentation referenced in the task specifies the following fields:
- * - property_id (required)
- * - reviewer_name
- * - reviewer_email
- * - rating (1-5 integer)
- * - title (short summary of the review)
- * - comment (full review body)
- * - language
- * - country
- * - travel_type
- * - source
- * - date (Y-m-d H:i:s)
- * - status (approved|pending)
- * - external_id (used to avoid duplicate imports)
- *
- * The LiteAPI payload does not include all these fields directly, so we derive as much
- * information as possible and provide sensible defaults for the rest.
+ * The user requested payload includes only the identifiers, review body and a hard-coded
+ * set of 1-star category ratings required by the WPRentals endpoint.
  *
  * @param array $review LiteAPI review item.
- * @return array
+ * @return array Minimal payload for the WPRentals review import endpoint.
  */
 function rcwpr_map_review_payload($review) {
-    $name = isset($review['name']) && $review['name'] !== '' ? $review['name'] : 'Anonymous';
-    $email = isset($review['reviewer_email']) && is_email($review['reviewer_email'])
-        ? $review['reviewer_email']
-        : rcwpr_generate_placeholder_email($name);
-
     $headline = isset($review['headline']) ? trim(wp_strip_all_tags($review['headline'])) : '';
     $pros = isset($review['pros']) ? trim(wp_strip_all_tags($review['pros'])) : '';
     $cons = isset($review['cons']) ? trim(wp_strip_all_tags($review['cons'])) : '';
@@ -423,19 +403,11 @@ function rcwpr_map_review_payload($review) {
 
     $comment = trim(implode("\n\n", array_filter($comment_sections, 'strlen')));
 
-    $language = isset($review['language']) ? sanitize_text_field($review['language']) : '';
-    $country = isset($review['country']) ? sanitize_text_field($review['country']) : '';
-    $travel_type = isset($review['type']) ? sanitize_text_field($review['type']) : '';
-    $source = isset($review['source']) ? sanitize_text_field($review['source']) : 'liteapi';
-
-    $date = rcwpr_normalize_review_date(isset($review['date']) ? $review['date'] : '');
-
     $title = $headline !== '' ? $headline : wp_html_excerpt($comment, 80, '...');
 
     return array(
         'property_id' => RCWPR_PROPERTY_ID,
         'user_id' => RCWPR_REVIEW_USER_ID,
-        'rating' => 1,
         'ratings' => array(
             'accuracy' => 1,
             'communication' => 1,
@@ -446,71 +418,7 @@ function rcwpr_map_review_payload($review) {
         ),
         'title' => $title,
         'content' => $comment,
-        'language' => $language,
-        'country' => $country,
-        'travel_type' => $travel_type,
-        'type' => $travel_type,
-        'source' => $source,
-        'date' => $date,
-        'status' => 'approved',
-        'external_id' => rcwpr_generate_external_id($review),
-        'reviewer_name' => $name,
-        'reviewer_email' => $email,
     );
-}
-
-/**
- * Normalise the review date to the format expected by the API (Y-m-d H:i:s).
- *
- * @param string $date_string
- * @return string
- */
-function rcwpr_normalize_review_date($date_string) {
-    if (empty($date_string)) {
-        return current_time('mysql', true);
-    }
-
-    $timestamp = strtotime($date_string);
-
-    if ($timestamp === false) {
-        return current_time('mysql', true);
-    }
-
-    return gmdate('Y-m-d H:i:s', $timestamp);
-}
-
-/**
- * Generate a stable hash for the review so we can prevent duplicates on the API side.
- *
- * @param array $review
- * @return string
- */
-function rcwpr_generate_external_id($review) {
-    $parts = array(
-        isset($review['date']) ? $review['date'] : '',
-        isset($review['name']) ? $review['name'] : '',
-        isset($review['averageScore']) ? $review['averageScore'] : '',
-        isset($review['pros']) ? $review['pros'] : '',
-        isset($review['cons']) ? $review['cons'] : ''
-    );
-
-    return md5(implode('|', $parts));
-}
-
-/**
- * Create a deterministic placeholder email address when the review does not provide one.
- *
- * @param string $name Reviewer name.
- * @return string
- */
-function rcwpr_generate_placeholder_email($name) {
-    $sanitized_name = sanitize_title($name);
-
-    if ($sanitized_name === '') {
-        $sanitized_name = 'guest-' . substr(md5($name), 0, 6);
-    }
-
-    return strtolower($sanitized_name) . '@example.com';
 }
 
 /**
