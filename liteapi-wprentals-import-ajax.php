@@ -118,10 +118,15 @@ add_action('wp_ajax_start_import', 'handle_liteapi_import');
  * @return void Outputs JSON response and exits
  */
 function handle_liteapi_import() {
-    
+
+    error_log('handle_liteapi_import: AJAX request received.');
+
     // Build the LiteAPI Reviews URL - FIXED to match working cURL
     $hotel_id = HOTEL_ID; // Reuse existing constant for hotel ID
     $url = 'https://api.liteapi.travel/v3.0/data/reviews?hotelId=' . $hotel_id . '&limit=' . RCWPR_LIMIT . '&timeout=4&getSentiment=false';
+
+    error_log('handle_liteapi_import: Requesting LiteAPI URL ' . $url);
+
     // Make HTTP GET request to LiteAPI using cURL directly (since wp_remote_get hangs)
     $ch = curl_init();
     curl_setopt($ch, CURLOPT_URL, $url);
@@ -137,35 +142,41 @@ function handle_liteapi_import() {
     $body = curl_exec($ch);
     $http_code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
     $error = curl_error($ch);
+    error_log('handle_liteapi_import: LiteAPI HTTP status ' . $http_code . ' (error: ' . ($error !== '' ? $error : 'none') . ')');
     curl_close($ch);
 
 
-    
+
     // Check for cURL errors
     if ($error) {
         wp_send_json_error('cURL Error: ' . $error);
+        error_log('handle_liteapi_import: Aborting due to cURL error.');
         return;
     }
-    
+
     // Check HTTP response code
     if ($http_code !== 200) {
         wp_send_json_error('LiteAPI returned HTTP ' . $http_code . '. Response: ' . substr($body, 0, 200));
+        error_log('handle_liteapi_import: LiteAPI non-200 response, aborting. Body snippet: ' . substr($body, 0, 500));
         return;
     }
     $response_data = json_decode($body, true);
-    
+    error_log('handle_liteapi_import: LiteAPI raw body length ' . strlen($body));
+
     // Check for JSON decode errors
     if (json_last_error() !== JSON_ERROR_NONE) {
         wp_send_json_error('Invalid JSON response from API: ' . json_last_error_msg());
+        error_log('handle_liteapi_import: JSON decode error - ' . json_last_error_msg());
         return;
     }
-    
+
     // Debug: Log the raw response
     error_log('LiteAPI Response: ' . $body);
     
     // Check if the response contains an error
     if (isset($response_data['error'])) {
         wp_send_json_error('API Error: ' . $response_data['error']);
+        error_log('handle_liteapi_import: API reported error - ' . print_r($response_data['error'], true));
         return;
     }
     
@@ -182,9 +193,12 @@ function handle_liteapi_import() {
     // Validate that we received review data
     if (empty($reviews) || !is_array($reviews)) {
         wp_send_json_error('No valid reviews found in API response. Response structure: ' . print_r($response_data, true));
+        error_log('handle_liteapi_import: No reviews found - ' . print_r($response_data, true));
         return;
     }
-    
+
+    error_log('handle_liteapi_import: Retrieved ' . count($reviews) . ' reviews from LiteAPI.');
+
     // Generate HTML table for displaying reviews
     $table_html = '<table class="wp-list-table widefat fixed striped">';
     
@@ -216,12 +230,18 @@ function handle_liteapi_import() {
     
     // Import to WPRentals
     import_to_wp_rentals($reviews);
-    
-    // Send success response
-    wp_send_json_success(array(
+
+    error_log('handle_liteapi_import: Finished pushing reviews to WPRentals. Preparing AJAX response.');
+
+    $response_payload = array(
         'table' => $table_html,
         'count' => count($reviews)
-    ));
+    );
+
+    error_log('handle_liteapi_import: Responding with payload: ' . json_encode($response_payload));
+
+    // Send success response
+    wp_send_json_success($response_payload);
 }
 
 
