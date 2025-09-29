@@ -1,0 +1,22 @@
+.success-message {
+    color: green;
+    font-weight: bold;
+}
+
+.error-message {
+    color: red;
+    font-weight: bold;
+}
+
+#import-status {
+    margin-top: 20px;
+}
+
+#properties-table {
+    margin-top: 20px;
+}
+
+#start-import {
+    font-size: 16px;
+    padding: 10px 20px;
+}
